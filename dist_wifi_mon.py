@@ -18,16 +18,17 @@ from subprocess import CalledProcessError, check_output
 # How to do the tests (add your own values here)
 ssid = ""
 s3_bucket = ""
+x_amz_acl = "private"
 access_key = ""
 secret_access_key = ""
-s3host = "http://s3-eu-west-1.s3.amazonaws.com"  # FIXME: hard-coded region
+s3host = "https://s3-eu-west-1.s3.amazonaws.com"  # FIXME: hard-coded region
 content_type = "text/plain"
 username = getpass.getuser()  # Can be a random string if you want 'privacy'
 cache = "/tmp/dist-wifi-mon"
 cache_limit = 4000  # Number of bytes of results to cache before sending
 cache_full = 99999  # Stop collecting data if the cache gets too full
 ping_timeout = "10000"  # milliseconds
-debug = False
+debug = True
 
 # What to test (you can change these, e.g. if you have a restricted network)
 dns_server = ""  # Use route-provided DNS
@@ -69,6 +70,20 @@ airport = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Curre
 on_wifi = check_output([airport, "-I"])
 if 'SSID: {}'.format(ssid) not in on_wifi:
     exit("Not on the {} network".format(ssid))
+
+# Check the size of the local cache
+filenames = os.listdir(cache)
+dir_size = sum([
+    os.path.getsize(os.path.join(cache, filename))
+        for filename in filenames])
+print "Current cache is {} bytes, will upload at {} bytes".format(
+    dir_size, cache_limit)
+if dir_size > cache_limit:
+    run = True
+else:
+    run = False
+if dir_size > cache_full:
+    exit("Local cache is full, refusing to run")
 
 # Ping check
 try:
@@ -128,48 +143,52 @@ if not (ping_time >= 0 and dns_time >= 0 and curl_time >= 0):
     exit()
 
 # If it is time to post data to s3, try to do so
-filenames = os.listdir(cache)
-dir_size = sum([
-    os.path.getsize(os.path.join(cache, filename))
-        for filename in filenames])
-print "Current cache is {} bytes, will upload at {} bytes".format(
-    dir_size, cache_limit)
-if dir_size > cache_limit:
-    outfile = "{0}/{1}-{2}".format(cache, str(t0_epoch), username)
-    _, outfilename = os.path.split(outfile)
+if run:
     if cache not in ["", "/", ".", "~"]:  # Don't blat important directories
-        with open(outfile, 'w') as o:
+        content = ''
+        outfile = "{0}/{1}-{2}".format(cache, str(t0_epoch), username)
+        _, outfilename = os.path.split(outfile)
+        content_length = 0
+        with open(outfile, 'wb') as o:
             for f in filenames:
                 if not f.endswith(getpass.getuser()):
                     with open(os.path.join(cache, f)) as i:
                         content = i.read()
                         o.write(content)
-
         m = hashlib.md5()
-        with open(outfile, 'r') as o:
-            content = o.read()
-            m.update(content)
-        content_md5 = m.hexdigest()
+        m.update(content)
+        content_md5 = base64.encodestring(m.digest()).strip()
+        content_length = len(content)
+
+        print sum(os.stat(os.path.join(_, filename)).st_size
+            for filename in os.listdir(_)
+                if not filename.endswith('ricicle'))
+        print os.stat(outfile).st_size
 
         # Calculate aws signature
-        str_to_sign = "PUT\n\n{0}\n{1}\n/s3-eu-west-1/{2}/{3}".format(
-            #content_md5,
+        str_to_sign = u"{0}\n{1}\n{2}\n{3}\n{4}\n/{5}/{6}".format(
+            'PUT',
+            content_md5,
             content_type,
             t0_awsformat,
-            s3_bucket,
+            "x-amz-acl:{}".format(x_amz_acl),
+            "s3-eu-west-1",
             outfilename)
         h = hmac.new(secret_access_key, str_to_sign, sha)
         b = base64.encodestring(h.digest()).strip()
 
         headers = [
-            "-H", "User-Agent: ",
+            #"-H", "User-Agent: ",
             "-H", "ACCEPT: ",
-            "-H", "Connection: ",
-            "-H", "Expect: ",
-            "-H", "PUT /{0}/{1} HTTP/1.0".format(s3_bucket, outfilename),
-            "-H", "Content-Type: {}".format(content_type),
+            "-H", "PUT /{1} HTTP/1.1".format(s3_bucket, outfilename),
             "-H", "Date: {}".format(t0_awsformat),
+            "-H", "Content-Type: {}".format(content_type),
+            "-H", "Connection: Keep-Alive",
+            #"-H", "Content-Length: {}".format(content_length),
+            "-H", "Content-MD5: {}".format(content_md5),
+            "-H", "x-amz-acl: {}".format(x_amz_acl),
             "-H", "Authorization: AWS {}:{}".format(access_key, b)]
+            #"-H", "Expect: 100-continue"]
 
         if debug:
             verbosity = '-v'
@@ -177,16 +196,32 @@ if dir_size > cache_limit:
             verbosity = ''
 
         curl_cmd = [
-            "curl", "-0", "-s", verbosity,
+            "curl", "-s", verbosity,
             "--retry", "10", "--retry-delay", "5",
-            "-X", "PUT", "-L",
-            "-d", "@{}".format(os.path.join(cache, outfile)) ] + headers + [
-            "{0}/{1}/{2}".format(s3host, s3_bucket, outfilename)]
+            "-X", "PUT"] + \
+            headers + [ "-T", "{}".format(os.path.join(cache, outfile)),
+            "{0}".format(s3host, s3_bucket, outfilename)]
+
+        print "Uploading {0} to {1} using {2}...".format(
+                outfile, s3host, curl_cmd)
+        curl_response = check_output(curl_cmd)
 
         if debug:
-            print "Uploading {0} to {1} using {2}...".format(
-                outfile, s3host, curl_cmd)
+            print "\nSigned this string:\n{}".format(str_to_sign)
+            try:
+                # Assume this is an error and print out the string AWS expects
+                bs = curl_response.split('StringToSignBytes')[1]
+                print "The StringToSignBytes is wrong. It should be:"
+                repl = [' ', '>', '<', '/']
+                for char in repl:
+                    if char in bs:
+                        bs = bs.replace(char, '')
+                print ''.join([ chr(ord(c)) for c in bs.replace(' ', '').decode('hex') ])
+            except:
+                pass
+            print "\nFull response from s3 was:\n{}".format(curl_response)
 
-        curl_response = check_output(curl_cmd)
-        print "Response from s3 was: {}".format(curl_response)
+    os.remove(outfile)
+
+
 print "Done."
